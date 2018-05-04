@@ -9,3 +9,4 @@ Qiita記事連動。
 
 * app-geturl.yaml
   * 短縮URLから元のURLを取得する方
+  * https://qiita.com/monamu/items/79054ca8e4a7a6a89213
