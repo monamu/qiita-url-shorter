@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+  # URLのデータを格納するバケット
+  DataBucket:
+    Type: AWS::S3::Bucket
+
+  # RestAPIからS3へアクセスするためのRole
+  APIRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: "sts:AssumeRole"
+            Principal:
+              Service: "apigateway.amazonaws.com"
+            Effect: Allow
+      Policies:
+      - PolicyName: default
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Action:
+              - "s3:GetObject"
+              Effect : Allow
+              Resource: !Sub "${DataBucket.Arn}/*"
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+  ResourceKey:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: "{key}"
+      RestApiId: !Ref RestApi
+  ResourceKeyMethodOPTIONS:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ResourceKey
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+            StatusCode: 200
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: "{\"statusCode\": 200}"
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: 200
+  ResourceKeyMethodGET:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ResourceKey
+      AuthorizationType: NONE
+      HttpMethod: GET
+      RequestParameters:
+        method.request.path.key: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${DataBucket}/{key}"
+        Credentials: !GetAtt APIRole.Arn
+        RequestParameters:
+          integration.request.path.key: method.request.path.key
+        IntegrationResponses:
+          - ResponseParameters:
+              # S3Object(JSON)のLocationプロパティを設定する
+              method.response.header.Location: "integration.response.body.Location"
+            ResponseTemplates:
+              application/json: ""
+            StatusCode: 301
+            SelectionPattern: "2\\d{2}"
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Location: false
+          StatusCode: 301
+
+  RestApiDeployment:
+    DependsOn:
+      - ResourceKeyMethodOPTIONS
+      - ResourceKeyMethodGET
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: "prod"
+      StageDescription:
+        StageName: "prod"
+        Description: "Production Stage"
+        MethodSettings:
+          - ResourcePath: "/*"
+            HttpMethod: "*"
+            LoggingLevel: ERROR
+            DataTraceEnabled: false
+
+Outputs:
+  DataBucket:
+    Value: !Ref DataBucket
+  Api:
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/{key}"
