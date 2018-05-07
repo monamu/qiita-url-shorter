@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  DataBucketName:
+    Type: String
+    MinLength: 1
+  GetUrlEndpoint:
+    Type: String
+    AllowedPattern: ^https:\/\/.*\/\{key\}$
+
+Resources:
+
+  GenerateUrl:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: >
+          const AWS = require('aws-sdk');
+
+          // ファイルの存在チェック
+
+          const exists = (key) => (new AWS.S3()).getObject({
+              Bucket: process.env.DataBucketName,
+              Key: key
+            }).promise()
+            .then(() => Promise.resolve(true))
+            .catch((e) => {
+              // ファイルを取得できないときはfalse。
+              if (e.statusCode === 404 || e.statusCode === 403) {
+                return Promise.resolve(false);
+              }
+              return Promise.reject(e);
+            });
+
+          const MAX_RETRY = 5;
+
+          let retries = -1;
+
+          const generateKey = () => new Promise((resolve, reject) => {
+            retries += 1;
+            const key = randStr();
+            if (retries >= MAX_RETRY) {
+              reject(`${retries}回のリトライで解決しませんでした。`);
+              return;
+            }
+            exists(key)
+              .then((isExist) => ((!isExist)? resolve(key) : generateKey()))
+              .catch(reject);
+          });
+
+          // ８文字のランダム文字列生成
+
+          const randStr = () => {
+            const c = 'abcdefghijklmnopqrstuvwxyz0123456789';
+            let str = '';
+            for (let i = 0; i < 8; ++i) {
+              str += c[Math.floor(Math.random() * c.length)];
+            }
+            return str;
+          };
+
+          exports.handler = (ev,cx,cb) => {
+            // console.log(JSON.stringify(ev));
+            const content = { Location: JSON.parse(ev.body).Url };
+            if (!content.Location) {
+              cb(null, {
+                  statusCode: 400,
+                  headers: { 'Access-Control-Allow-Origin': '*' },
+                  body: JSON.stringify({ error: 'Insufficient parameters.' })
+                });
+              return;
+            }
+            let key;
+            Promise.resolve()
+              .then(() => generateKey().then((r) => (key = r)))
+              .then(() => (new AWS.S3()).putObject({
+                Bucket: process.env.DataBucketName,
+                Key: key,
+                ContentType: 'application/json',
+                Body: JSON.stringify(content)
+              }).promise())
+              .then(() => {
+                cb(null, {
+                  statusCode: 200,
+                  headers: { 'Access-Control-Allow-Origin': '*' },
+                  body: JSON.stringify({ Url: process.env.GetUrlEndpoint.replace(/\{key\}/, key) })
+                });
+              })
+              .catch((e) => {
+                console.log('ERROR', e);
+                cb(null, {
+                  statusCode: 400,
+                  headers: { 'Access-Control-Allow-Origin': '*' },
+                  body: JSON.stringify({ error: 'error' })
+                });
+              })
+          };
+      Handler: "index.handler"
+      MemorySize: 512
+      Runtime: "nodejs6.10"
+      Timeout: 60
+      Role: !GetAtt GenerateUrlRole.Arn
+      Environment:
+        Variables:
+          DataBucketName: !Ref DataBucketName
+          GetUrlEndpoint: !Ref GetUrlEndpoint
+  GenerateUrlRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: "sts:AssumeRole"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Effect: Allow
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: default
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Effect: Allow
+                Resource: !Sub "arn:aws:s3:::${DataBucketName}/*"
+
+  PermissionToGenerateUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref GenerateUrl
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*"
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+  MethodOPTIONS:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !GetAtt RestApi.RootResourceId
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+            StatusCode: 200
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: "{\"statusCode\": 200}"
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: 200
+  MethodPOST:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !GetAtt RestApi.RootResourceId
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - ResponseTemplates:
+              "application/json": ""
+            StatusCode: 200
+        PassthroughBehavior: WHEN_NO_MATCH
+        Type: AWS_PROXY
+        Uri:
+          Fn::Sub:
+            - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${func}/invocations"
+            - func: !GetAtt GenerateUrl.Arn
+      MethodResponses:
+        - ResponseModels:
+            "application/json": Empty
+          StatusCode: 200
+
+  RestApiDeployment:
+    DependsOn:
+      - MethodOPTIONS
+      - MethodPOST
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: "prod"
+      StageDescription:
+        StageName: "prod"
+        Description: "Production Stage"
+        MethodSettings:
+          - ResourcePath: "/*"
+            HttpMethod: "*"
+            LoggingLevel: ERROR
+            DataTraceEnabled: false
+
+Outputs:
+  Api:
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/"
